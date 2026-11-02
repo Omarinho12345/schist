@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A rejected proposal's reason can become a standard the viewer agent must check.** Reject in the viewer now asks why. With *save as a standard*, the reason is written as an ordinary note in the proposal's directory, tagged `standard` and `applies-to:<directory>`, through `schist add` and the same hub-scope check as approve; the first line becomes its title. The agent has a new read-only `get_standards` tool, and `propose_note` / `propose_link` refuse a proposal whose `checked_standards` leaves out any standard for its directory, so a reason given once is checked on every later proposal there. Each proposal card shows the standards it was checked against. A standard applies once the index includes it (a spoke's post-commit hook refreshes it); setting a standard note's status to `archived` retires it. If saving the standard fails, the proposal stays open. `POST /api/proposals/<id>/reject` accepts an optional JSON body `{reason, save_standard}`; a request with no body rejects as before.
+
 ### Changed
 - **`--vault` and `--db` can follow the subcommand.** `schist doctor --vault ~/vault`, `schist add --vault ~/vault --title …` and `schist sync push --vault ~/vault` failed with "unrecognized arguments", because both options were accepted only before the subcommand, yet the README's quick start and the guides wrote them after it. Every subcommand now accepts them in either place; given in both, the one after the subcommand wins, and `SCHIST_VAULT_PATH` still applies when neither is given.
 
