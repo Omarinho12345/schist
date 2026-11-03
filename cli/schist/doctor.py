@@ -981,6 +981,28 @@ def check_ingest_available(vault_path: Optional[str]) -> CheckResult:
                 "imports env_utils with no inline fallback and no sibling "
                 "env_utils.py (#369) — the post-commit hook fails on every commit"
             )
+        # The copy must parse `## Connections` sections with this CLI's rule,
+        # or the index it builds disagrees with what the CLI and MCP server
+        # write and validate. Each rule change bumps CONNECTIONS_RULE_VERSION
+        # in ingest.py; a copy without the marker predates rule 2 (any line
+        # starting with `## Connections` was a heading, fences were ignored).
+        # A copy with a different version, older or newer, reads another rule.
+        from .ingest import CONNECTIONS_RULE_VERSION
+        rule = re.search(r"^CONNECTIONS_RULE_VERSION\s*=\s*(\d+)", script_text, re.MULTILINE)
+        if rule is None:
+            issues.append(
+                "has no CONNECTIONS_RULE_VERSION, so it reads ## Connections "
+                "sections with the old rule (any line starting with "
+                "'## Connections', fenced code included) — refresh the hook copy"
+            )
+        elif int(rule.group(1)) != CONNECTIONS_RULE_VERSION:
+            # Either direction is skew: an older copy indexes edges this CLI
+            # does not read, a newer one (from a later schist) the reverse.
+            issues.append(
+                f"reads ## Connections sections with rule v{rule.group(1)} but "
+                f"this installed schist uses v{CONNECTIONS_RULE_VERSION} — "
+                "refresh the hook copy, or upgrade schist if the copy is newer"
+            )
         if issues:
             return CheckResult(
                 "WARN", "Ingest",
@@ -2907,6 +2929,25 @@ def _mcp_dist_dir_from_config(vault_path: Optional[str]) -> Optional[Path]:
     Mirrors `check_mcp_config`'s lookup order so doctor reports against the
     actual deployed dist (not just the source checkout's local build).
     """
+    for entry in _mcp_config_entries(vault_path):
+        args = entry.get("args")
+        if not isinstance(args, list) or not args:
+            continue
+        args0 = Path(str(args[0]))
+        if args0.is_file():
+            return args0.parent
+    return None
+
+
+def _mcp_config_entry(vault_path: Optional[str]) -> Optional[dict]:
+    """The configured schist MCP server entry ({"command", "args", ...}) of
+    the first config file that has one, or None."""
+    return next(_mcp_config_entries(vault_path), None)
+
+
+def _mcp_config_entries(vault_path: Optional[str]):
+    """Each config file's schist MCP server entry, in `check_mcp_config`'s
+    order."""
     candidates = [
         Path.home() / ".claude.json",
         Path.home() / ".claude" / "settings.json",
@@ -2949,12 +2990,54 @@ def _mcp_dist_dir_from_config(vault_path: Optional[str]) -> Optional[Path]:
                     break
         if not entry:
             continue
-        args = entry.get("args")
-        if not isinstance(args, list) or not args:
-            continue
-        args0 = Path(str(args[0]))
-        if args0.is_file():
-            return args0.parent
+        yield entry
+
+
+def _mcp_server_dist_dir(entry: dict) -> Optional[Path]:
+    """The dist/ directory of the server `entry` starts, or None when it
+    cannot be found. Follows symlinks: `node <link>` where the link points
+    into dist/, and a bare command (a bin link on PATH, found with
+    shutil.which and resolved). `npx` and a command whose target has no
+    dist/ fall back to the npm global install (`npm root -g`)."""
+    def dist_of(path: Path) -> Optional[Path]:
+        try:
+            real = path.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            # ValueError: a path with a NUL byte, from a hand-edited config.
+            return None
+        if not real.is_file():
+            return None
+        for d in (real.parent, real.parent.parent, real.parent.parent.parent):
+            if (d / "markdown-parser.js").is_file():
+                return d
+            if (d / "dist" / "markdown-parser.js").is_file():
+                return d / "dist"
+        return real.parent
+
+    command = str(entry.get("command") or "")
+    args = entry.get("args") if isinstance(entry.get("args"), list) else []
+    base = Path(command).name
+    if base in ("node", "node.exe", "nodejs") or not command:
+        for a in args:
+            a = str(a)
+            if a.startswith("-"):
+                continue
+            found = dist_of(Path(a))
+            if found is not None:
+                return found
+            break
+        return None
+    if base not in ("npx", "npx.cmd"):
+        on_path = shutil.which(command) if os.sep not in command else command
+        if on_path:
+            found = dist_of(Path(on_path))
+            if found is not None:
+                return found
+    from .mcp_locate import _npm_global_entry
+
+    npm = _npm_global_entry()
+    if npm is not None and npm.is_file():
+        return npm.resolve().parent
     return None
 
 
@@ -3238,6 +3321,62 @@ def check_mcp_cli_spawn(vault_path: Optional[str]) -> CheckResult:
         f"{len(ok)} MCP client entr{'y' if len(ok) == 1 else 'ies'} can spawn both CLIs "
         f"from a GUI-launched process ({', '.join(ok)})",
     )
+
+
+_MCP_RULE_VERSION_RE = re.compile(r"CONNECTIONS_RULE_VERSION\s*=\s*(\d+)")
+
+
+def check_mcp_connections_rule(vault_path: Optional[str]) -> CheckResult:
+    """The MCP server and this CLI must read `## Connections` sections with
+    the same rule: the server's writers check their output with it and
+    update_note validates the edges it finds, so a server on another rule
+    lets through edges ingest reads differently. Compares the built server's
+    CONNECTIONS_RULE_VERSION (dist/markdown-parser.js) with ingest.py's."""
+    from .ingest import CONNECTIONS_RULE_VERSION
+
+    name = "MCP connection rule"
+    fix = (
+        "Upgrade the MCP server and the CLI together (`npm install -g @schist/mcp-server`, "
+        "or `cd <schist>/mcp-server && npm run build` in a checkout), then restart the MCP client."
+    )
+    entry = _mcp_config_entry(vault_path)
+    if entry is None:
+        return CheckResult("SKIP", name, "skipped (no MCP config)")
+    # A configured server whose rule cannot be read is reported, not
+    # skipped: an old server is exactly the skew this check is for.
+    dist_dir = _mcp_server_dist_dir(entry)
+    if dist_dir is None:
+        return CheckResult(
+            "WARN", name,
+            "cannot find the configured MCP server's files "
+            f"(command {entry.get('command')!r}), so its ## Connections rule is unknown",
+            fix=fix,
+        )
+    try:
+        text = (dist_dir / "markdown-parser.js").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return CheckResult(
+            "WARN", name,
+            f"cannot read {dist_dir / 'markdown-parser.js'}, so the configured MCP server's "
+            "## Connections rule is unknown",
+            fix=fix,
+        )
+    m = _MCP_RULE_VERSION_RE.search(text)
+    if m is None:
+        return CheckResult(
+            "WARN", name,
+            "the MCP server predates the shared ## Connections rule "
+            f"(this CLI uses rule v{CONNECTIONS_RULE_VERSION})",
+            fix=fix,
+        )
+    if int(m.group(1)) != CONNECTIONS_RULE_VERSION:
+        return CheckResult(
+            "WARN", name,
+            f"the MCP server reads ## Connections sections with rule v{m.group(1)}, "
+            f"this CLI with v{CONNECTIONS_RULE_VERSION}",
+            fix=fix,
+        )
+    return CheckResult("PASS", name, f"in sync (rule v{CONNECTIONS_RULE_VERSION})")
 
 
 def check_mcp_schema_alignment(vault_path: Optional[str]) -> CheckResult:
@@ -3800,6 +3939,7 @@ def run_doctor(vault_path: Optional[str], db_path: Optional[str],
         check_mcp_config(vault_path),
         check_mcp_cli_spawn(vault_path),
         check_mcp_schema_alignment(vault_path),
+        check_mcp_connections_rule(vault_path),
         check_mcp_vocab_alignment(vault_path),
         check_memory_db_path(vault_path),
         check_vault_access(vault_path),

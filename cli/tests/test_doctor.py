@@ -1414,6 +1414,8 @@ class TestCheckIngestAvailableStaleHandCopy:
 
     def test_pass_when_354_window_copy_has_env_utils_sibling(self, tmp_path):
         """The #354-window copy WITH the env_utils.py sibling works — no WARN."""
+        from schist.ingest import CONNECTIONS_RULE_VERSION
+
         window_copy = (
             "#!/usr/bin/env python3\n"
             "try:\n"
@@ -1421,6 +1423,8 @@ class TestCheckIngestAvailableStaleHandCopy:
             "except ImportError:\n"
             "    from env_utils import env_flag\n"
             "from index_contract import INDEX_SCHEMA_VERSION\n"
+            # Keeps this case about env_utils, not the connection rule.
+            f"CONNECTIONS_RULE_VERSION = {CONNECTIONS_RULE_VERSION}\n"
         )
         vault = self._vault_with_copy(
             tmp_path, with_sibling=True, script_text=window_copy
@@ -1432,6 +1436,57 @@ class TestCheckIngestAvailableStaleHandCopy:
         with patch.dict(os.environ, {"SCHIST_INGEST_SCRIPT": ""}, clear=False):
             r = check_ingest_available(str(vault))
         assert r.status == "PASS", r.message
+
+    def test_warn_when_copy_has_no_connections_rule_version(self, tmp_path):
+        """A copy from before the exact, fence-aware ## Connections rule has
+        no CONNECTIONS_RULE_VERSION and indexes edges the CLI and MCP server
+        no longer write or see."""
+        vault = self._vault_with_copy(tmp_path, with_sibling=True)
+        script = tmp_path / ".schist" / "ingest.py"
+        text = script.read_text()
+        assert "\nCONNECTIONS_RULE_VERSION = " in text  # fixture guard
+        script.write_text(text.replace("\nCONNECTIONS_RULE_VERSION = ", "\nOTHER_VERSION = "))
+        with patch.dict(os.environ, {"SCHIST_INGEST_SCRIPT": ""}, clear=False):
+            r = check_ingest_available(str(vault))
+        assert r.status == "WARN"
+        assert "has no CONNECTIONS_RULE_VERSION" in r.message
+        assert "refresh the hook copy" in r.message
+
+    def test_warn_when_copy_has_older_connections_rule_version(self, tmp_path):
+        import re as _re
+
+        vault = self._vault_with_copy(tmp_path, with_sibling=True)
+        script = tmp_path / ".schist" / "ingest.py"
+        text, n = _re.subn(
+            r"^CONNECTIONS_RULE_VERSION = \d+", "CONNECTIONS_RULE_VERSION = 1",
+            script.read_text(), flags=_re.MULTILINE,
+        )
+        assert n == 1
+        script.write_text(text)
+        with patch.dict(os.environ, {"SCHIST_INGEST_SCRIPT": ""}, clear=False):
+            r = check_ingest_available(str(vault))
+        assert r.status == "WARN"
+        assert "rule v1" in r.message
+
+    def test_warn_when_copy_has_newer_connections_rule_version(self, tmp_path):
+        """A copy from a later schist reads a rule this CLI does not."""
+        import re as _re
+
+        from schist.ingest import CONNECTIONS_RULE_VERSION
+
+        newer = CONNECTIONS_RULE_VERSION + 1
+        vault = self._vault_with_copy(tmp_path, with_sibling=True)
+        script = tmp_path / ".schist" / "ingest.py"
+        text, n = _re.subn(
+            r"^CONNECTIONS_RULE_VERSION = \d+", f"CONNECTIONS_RULE_VERSION = {newer}",
+            script.read_text(), flags=_re.MULTILINE,
+        )
+        assert n == 1
+        script.write_text(text)
+        with patch.dict(os.environ, {"SCHIST_INGEST_SCRIPT": ""}, clear=False):
+            r = check_ingest_available(str(vault))
+        assert r.status == "WARN"
+        assert f"rule v{newer}" in r.message
 
     def test_pass_when_current_copy_lacks_env_utils_sibling(self, tmp_path):
         """The CURRENT ingest.py defines the env_flag fallback inline, so a
@@ -5447,3 +5502,136 @@ class TestCheckVaultAccess:
         results = run_doctor(str(vault), None)
         assert any(r.label == "Vault access" and r.status == "FAIL"
                    for r in results)
+
+
+class TestCheckMcpConnectionsRule:
+    """The built MCP server carries CONNECTIONS_RULE_VERSION; doctor warns
+    when it differs from ingest.py's, or is missing (an older server)."""
+
+    def _setup(self, tmp_path: Path, monkeypatch, js: str | None) -> None:
+        dist_dir = tmp_path / "mcp" / "dist"
+        dist_dir.mkdir(parents=True)
+        (dist_dir / "index.js").write_text("// stub\n")
+        if js is not None:
+            (dist_dir / "markdown-parser.js").write_text(js)
+        (tmp_path / ".claude.json").write_text(json.dumps({
+            "mcpServers": {"schist": {"command": "node", "args": [str(dist_dir / "index.js")]}}
+        }))
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+
+    def test_pass_when_versions_match(self, tmp_path, monkeypatch):
+        from schist.doctor import check_mcp_connections_rule
+        from schist.ingest import CONNECTIONS_RULE_VERSION
+
+        self._setup(tmp_path, monkeypatch, f"export const CONNECTIONS_RULE_VERSION = {CONNECTIONS_RULE_VERSION};\n")
+        r = check_mcp_connections_rule(None)
+        assert r.status == "PASS", r.message
+
+    def test_warn_when_versions_differ(self, tmp_path, monkeypatch):
+        from schist.doctor import check_mcp_connections_rule
+        from schist.ingest import CONNECTIONS_RULE_VERSION
+
+        self._setup(tmp_path, monkeypatch, f"export const CONNECTIONS_RULE_VERSION = {CONNECTIONS_RULE_VERSION + 1};\n")
+        r = check_mcp_connections_rule(None)
+        assert r.status == "WARN"
+        assert f"rule v{CONNECTIONS_RULE_VERSION + 1}" in r.message
+
+    def test_warn_when_server_has_no_version(self, tmp_path, monkeypatch):
+        from schist.doctor import check_mcp_connections_rule
+
+        self._setup(tmp_path, monkeypatch, "export function parseConnections() {}\n")
+        r = check_mcp_connections_rule(None)
+        assert r.status == "WARN"
+        assert "predates the shared" in r.message
+
+    def _dist(self, tmp_path: Path, version: int) -> Path:
+        dist = tmp_path / "pkg" / "dist"
+        dist.mkdir(parents=True)
+        (dist / "index.js").write_text("// stub\n")
+        (dist / "markdown-parser.js").write_text(f"export const CONNECTIONS_RULE_VERSION = {version};\n")
+        return dist
+
+    def _config(self, tmp_path: Path, monkeypatch, entry: dict) -> None:
+        (tmp_path / ".claude.json").write_text(json.dumps({"mcpServers": {"schist": entry}}))
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr("schist.mcp_locate._npm_global_entry", lambda: None)
+
+    def test_follows_a_symlinked_entry(self, tmp_path, monkeypatch):
+        from schist.doctor import check_mcp_connections_rule
+
+        dist = self._dist(tmp_path, 1)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "schist-mcp.js").symlink_to(dist / "index.js")
+        self._config(tmp_path, monkeypatch, {"command": "node", "args": [str(bin_dir / "schist-mcp.js")]})
+        r = check_mcp_connections_rule(None)
+        assert r.status == "WARN", r.message
+        assert "rule v1" in r.message
+
+    def test_finds_a_bare_command_on_path(self, tmp_path, monkeypatch):
+        from schist.doctor import check_mcp_connections_rule
+
+        dist = self._dist(tmp_path, 1)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        link = bin_dir / "schist-mcp"
+        link.symlink_to(dist / "index.js")
+        (dist / "index.js").chmod(0o755)
+        monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+        self._config(tmp_path, monkeypatch, {"command": "schist-mcp", "args": []})
+        r = check_mcp_connections_rule(None)
+        assert r.status == "WARN", r.message
+        assert "rule v1" in r.message
+
+    def test_npx_uses_the_npm_global_install(self, tmp_path, monkeypatch):
+        from schist.doctor import check_mcp_connections_rule
+
+        dist = self._dist(tmp_path, 1)
+        self._config(tmp_path, monkeypatch, {"command": "npx", "args": ["-y", "@schist/mcp-server"]})
+        monkeypatch.setattr("schist.mcp_locate._npm_global_entry", lambda: dist / "index.js")
+        r = check_mcp_connections_rule(None)
+        assert r.status == "WARN", r.message
+        assert "rule v1" in r.message
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"command": "node", "args": ["/opt/x\u0000y/dist/index.js"]},
+            {"command": "/opt/a\u0000b/bin/schist-mcp", "args": []},
+        ],
+        ids=["nul-in-args", "nul-in-command"],
+    )
+    def test_warn_when_a_configured_path_holds_a_nul_byte(self, tmp_path, monkeypatch, entry):
+        """resolve() raises ValueError on a NUL byte; doctor reports the
+        server as unreadable instead of stopping with a traceback."""
+        from schist.doctor import check_mcp_connections_rule
+
+        self._config(tmp_path, monkeypatch, entry)
+        r = check_mcp_connections_rule(None)
+        assert r.status == "WARN", r.message
+        assert "cannot find the configured MCP server" in r.message
+
+    def test_warn_when_the_configured_server_cannot_be_read(self, tmp_path, monkeypatch):
+        from schist.doctor import check_mcp_connections_rule
+
+        self._config(tmp_path, monkeypatch, {"command": "node", "args": [str(tmp_path / "gone" / "index.js")]})
+        r = check_mcp_connections_rule(None)
+        assert r.status == "WARN", r.message
+        assert "rule is unknown" in r.message
+
+        dist = self._dist(tmp_path, 2)
+        (dist / "markdown-parser.js").unlink()
+        self._config(tmp_path, monkeypatch, {"command": "node", "args": [str(dist / "index.js")]})
+        r = check_mcp_connections_rule(None)
+        assert r.status == "WARN", r.message
+        assert "cannot read" in r.message
+
+    def test_real_source_carries_the_cli_version(self):
+        """The TypeScript source declares the same version as ingest.py, in
+        the form the check reads from the build."""
+        from schist.doctor import _MCP_RULE_VERSION_RE
+        from schist.ingest import CONNECTIONS_RULE_VERSION
+
+        src = (Path(__file__).resolve().parents[2] / "mcp-server" / "src" / "markdown-parser.ts").read_text()
+        m = _MCP_RULE_VERSION_RE.search(src)
+        assert m is not None and int(m.group(1)) == CONNECTIONS_RULE_VERSION
