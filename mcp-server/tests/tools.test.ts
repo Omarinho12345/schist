@@ -16,7 +16,7 @@ import { get_note, loadVaultConfig, create_note, create_concept, update_note, de
 import { writeMutex } from "../src/git-writer.js";
 import Database from "better-sqlite3";
 import { INDEX_SCHEMA_VERSION, memoryDbPath } from "../src/sqlite-reader.js";
-import { parseConnections, parseNote } from "../src/markdown-parser.js";
+import { frontmatterLength, parseConnections, parseNote } from "../src/markdown-parser.js";
 import { localSchistWrapperScript, spawnHolder } from "./local-schist-bin.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -623,6 +623,50 @@ describe("write-path validation and normalization (#276/#302/#304)", () => {
     expect(res.error).toBe("VALIDATION_ERROR");
     expect(res.message).toContain('"legacy-type"');
     expect(await fs.readFile(path.join(vault, rel), "utf-8")).toBe(original);
+  }, 30000);
+
+  test("update_note keeps a body that ingest would read as frontmatter in the body", async () => {
+    const vault = await makeTempVault();
+    const config = await loadVaultConfig(vault);
+    const rel = "notes/2026-11-03-plain.md";
+    await fs.mkdir(path.join(vault, "notes"), { recursive: true });
+    await fs.writeFile(path.join(vault, rel), "# Legacy plain note\n\nProse.\n", "utf-8");
+    await execFile("git", ["add", rel], { cwd: vault });
+    await execFile("git", ["commit", "-m", "add plain note"], { cwd: vault });
+
+    const body = '{\n"concepts": ["x"], "source_agent": "someone-else"\n}\nProse.\n';
+    const res = await update_note(vault, { owner: TEST_AGENT, id: rel, body }, config) as {
+      updated?: boolean; error?: string;
+    };
+    expect(res.error).toBeUndefined();
+    expect(res.updated).toBe(true);
+    const written = await fs.readFile(path.join(vault, rel), "utf-8");
+    // Ingest reads the empty block only; the JSON stays body text.
+    expect(written).toBe(`---\n---\n${body}`);
+    expect(frontmatterLength(written)).toBe("---\n---\n".length);
+  }, 30000);
+
+  test.each([
+    ["five-dash fences", "-----\ntitle: T\nconcepts: [c]\nsource_agent: a\n-----\nbody\n\n## Connections\n\n- extends: notes/a.md\n"],
+    ["a leading blank line", "\n---\ntitle: T\nconcepts: [c]\n---\nbody\n"],
+    ["a BOM", "\uFEFF---\ntitle: T\n---\nbody\n"],
+  ])("update_note refuses a note that opens with %s, whose frontmatter ingest reads differently", async (_name, original) => {
+    const vault = await makeTempVault();
+    const config = await loadVaultConfig(vault);
+    const rel = "notes/2026-11-03-split.md";
+    await fs.mkdir(path.join(vault, "notes"), { recursive: true });
+    await fs.writeFile(path.join(vault, rel), original, "utf-8");
+    await execFile("git", ["add", rel], { cwd: vault });
+    await execFile("git", ["commit", "-m", "add split note"], { cwd: vault });
+
+    for (const args of [{ frontmatter_patch: { status: "draft" } }, { body: "New body.\n" }]) {
+      const res = await update_note(vault, { owner: TEST_AGENT, id: rel, ...args }, config) as {
+        error: string; message: string;
+      };
+      expect(res.error).toBe("VALIDATION_ERROR");
+      expect(res.message).toMatch(/^update_note refused: .*frontmatter.*Nothing was written\.$/);
+      expect(await fs.readFile(path.join(vault, rel), "utf-8")).toBe(original);
+    }
   }, 30000);
 
   test("update_note still rejects a NEW out-of-vocabulary edge even alongside a grandfathered one (#363)", async () => {
@@ -5459,6 +5503,52 @@ describe("delete_note", () => {
     const after = await fs.readFile(linkerPath, "utf-8");
     expect(after).toContain("concepts: []");
     expect(after).not.toContain("Machine Learning");
+  }, 30000);
+
+  it.each([
+    ["-----\ntitle: Linker Split\nconcepts:\n  - machine-learning\n-----\n\nb\n", "refused"],
+    ["\uFEFF---\ntitle: Linker BOM\nconcepts:\n  - machine-learning\n---\n\nb\n", "unchanged"],
+  ])("cascade with a linker whose frontmatter ingest reads differently: %j is %s", async (linker, outcome) => {
+    const vault = await makeTempVault();
+    await fs.writeFile(
+      path.join(vault, "schist.yaml"),
+      "name: Test Vault\nwrite_branch: drafts\ndirectories:\n  - notes\n  - papers\n  - concepts\nstatuses:\n  - draft\n  - final\nconnection_types:\n  - extends\n  - supports\n",
+    );
+    await execFile("git", ["add", "schist.yaml"], { cwd: vault });
+    await execFile("git", ["commit", "-m", "add concepts dir"], { cwd: vault });
+    const config = await loadVaultConfig(vault);
+    const conceptId = "concepts/machine-learning.md";
+    const linkerId = "notes/2026-11-03-linker-split.md";
+    await fs.mkdir(path.join(vault, "concepts"), { recursive: true });
+    await fs.mkdir(path.join(vault, "notes"), { recursive: true });
+    await fs.writeFile(
+      path.join(vault, conceptId),
+      "---\nconcept: machine-learning\ntitle: Machine Learning\n---\n\nb\n",
+      "utf-8",
+    );
+    await fs.writeFile(path.join(vault, linkerId), linker, "utf-8");
+    await execFile("git", ["add", conceptId, linkerId], { cwd: vault });
+    await execFile("git", ["commit", "-m", "add concept cascade fixtures"], { cwd: vault });
+    await seedEdgesDb(vault, [{ source: linkerId, target: "machine-learning", type: "references" }]);
+
+    const res = await delete_note(vault, { owner: TEST_AGENT, id: conceptId, cascade: true }, config) as {
+      deleted?: boolean; repaired?: string[]; error?: string; message?: string;
+    };
+    if (outcome === "refused") {
+      // Ingest reads `concepts: [machine-learning]`; gray-matter reads no
+      // frontmatter, so a rewrite could not remove it. Nothing is deleted.
+      expect(res.error).toBe("VALIDATION_ERROR");
+      expect(res.message).toContain(linkerId);
+      expect(res.message).toMatch(/reads as body text/);
+      expect(await fs.readFile(path.join(vault, conceptId), "utf-8")).toContain("Machine Learning");
+    } else {
+      // Ingest reads no frontmatter behind a BOM, so there is no reference to
+      // strip, and the linker is left as it is.
+      expect(res.error).toBeUndefined();
+      expect(res.deleted).toBe(true);
+      expect(res.repaired ?? []).not.toContain(linkerId);
+    }
+    expect(await fs.readFile(path.join(vault, linkerId), "utf-8")).toBe(linker);
   }, 30000);
 
   it("a failed delete rolls back only its own paths, preserving unrelated uncommitted edits (#119)", async () => {

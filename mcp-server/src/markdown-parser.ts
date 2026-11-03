@@ -790,6 +790,55 @@ export function parseNote(content: string): {
   };
 }
 
+/** A rewrite refused because this server and ingest would not read the
+ * note's frontmatter as the same block: nothing written. normalizeError
+ * turns it into a VALIDATION_ERROR. */
+export class FrontmatterSplitError extends Error {
+  readonly error = "VALIDATION_ERROR";
+}
+
+// What may follow gray-matter's split on the closing line before ingest's
+// split: the rest of a `---` closing line, which ingest takes as part of it.
+const CLOSING_LINE_TAIL_RE = /^[ \t\v\f]*\n?$/;
+
+/**
+ * Why parseNote's frontmatter (gray-matter's split) is not the block ingest
+ * reads (frontmatterLength), or null when they are the same block. They
+ * differ on a note that opens with a BOM, blank lines, `-----`, `---yaml`,
+ * a JSON `{` line or a TOML `+++` line, and on one whose frontmatter closes
+ * on a line like `-----` or `---foo`. Rewriting such a note from parseNote's
+ * metadata and body would change the frontmatter ingest reads, so writers
+ * refuse it (parseNoteForRewrite).
+ */
+export function frontmatterSplitMismatch(content: string): string | null {
+  const patched = patchFrontmatterFlowHashtags(normalizeNewlines(content));
+  const parsed = matter(patched, YAML_ONLY);
+  const ours = patched.endsWith(parsed.content) ? patched.length - parsed.content.length : -1;
+  const ingest = frontmatterLength(patched);
+  if (ours === ingest) return null;
+  if (ours > 0 && ingest > ours && CLOSING_LINE_TAIL_RE.test(patched.slice(ours, ingest))) return null;
+  if (ours === 0) return "the index reads a frontmatter block at the start of the note that this server reads as body text";
+  if (ingest === 0) {
+    return "this server reads a frontmatter block that the index does not (the note opens with a BOM or a line other than `---`)";
+  }
+  return "this server and the index end the note's frontmatter at different lines";
+}
+
+/** parseNote for a writer that rewrites the note from its metadata and body:
+ * throws FrontmatterSplitError when frontmatterSplitMismatch finds one. */
+export function parseNoteForRewrite(content: string, action: string): ReturnType<typeof parseNote> {
+  const parsed = parseNote(content);
+  const mismatch = frontmatterSplitMismatch(content);
+  if (mismatch !== null) {
+    throw new FrontmatterSplitError(
+      `${action} refused: ${mismatch}, so rewriting it would change the frontmatter the index reads. ` +
+      "Edit the file so it opens with a plain `---` line (no BOM or blank lines before it) and its " +
+      "frontmatter closes with a `---` line, then retry. Nothing was written.",
+    );
+  }
+  return parsed;
+}
+
 /** A scan's problem as the tools report it (1-based line in the scanned
  * lines), or null when the problem does not matter: there is no
  * Connections heading, so nothing would be indexed anyway. */
@@ -993,10 +1042,21 @@ export function buildNote(
   // a YAML block would be merged into the frontmatter.
   let out = matter.stringify({ content }, metadata, YAML_ONLY);
   // With no metadata gray-matter writes no frontmatter block, and a body that
-  // opens with `---` would become the note's first line: read back as its
-  // frontmatter, or refused by the hub. An empty block keeps it body text.
-  if (Object.keys(metadata).length === 0 && /^\uFEFF*---/.test(content)) {
-    out = `---\n---\n${out}`;
+  // opens with `---`, or with anything else ingest reads as frontmatter
+  // (frontmatterLength: blank lines then `---`, a JSON `{` block, a TOML
+  // `+++` block), would become the note's frontmatter, or be refused by the
+  // hub. An empty block keeps it body text.
+  const empty = Object.keys(metadata).length === 0;
+  const wrap = empty && (/^\uFEFF*---/.test(content) || frontmatterLength(content) > 0);
+  if (wrap) out = `---\n---\n${out}`;
+  // Ingest must read exactly the block written: a `---` line, the YAML
+  // (none when wrapping), a `---` line; or no block at all.
+  const close = empty && !wrap ? -1 : out.indexOf("\n---\n", 3);
+  const written = close === -1 ? 0 : close + 5;
+  if ((!empty || wrap) && close === -1 || frontmatterLength(out) !== written) {
+    throw new FrontmatterSplitError(
+      "writing the note refused: the index would not read the frontmatter that was written. Nothing was written.",
+    );
   }
   verifyNoteConnections(out, expected, "writing the note");
   return out;

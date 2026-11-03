@@ -11,7 +11,7 @@ import { load as yamlLoad } from "js-yaml";
 import * as sqliteReader from "./sqlite-reader.js";
 import { writeNote, rewriteNote, updateNote, deleteNote, writeMutex, vaultLockWaitMs } from "./git-writer.js";
 import { withVaultLock, VaultLockTimeout, VaultLockFailed } from "./vault-lock.js";
-import { buildNote, buildConnectionLine, insertConnectionLine, parseNote, hasNonYamlOpener, SLUG_WS_CHARS, containsLineBoundary, isRoundTrippableTarget, hasConnectionsHeading, trimConnectionWs, splitConnectionLines, normalizeNewlines, scanConnections, scanNoteConnections, connectionsProblemOf, verifyNoteConnections, isBlank, decodeNoteBytes, NoteDecodeError } from "./markdown-parser.js";
+import { buildNote, buildConnectionLine, insertConnectionLine, parseNote, parseNoteForRewrite, frontmatterLength, hasNonYamlOpener, SLUG_WS_CHARS, containsLineBoundary, isRoundTrippableTarget, hasConnectionsHeading, trimConnectionWs, splitConnectionLines, normalizeNewlines, scanConnections, scanNoteConnections, connectionsProblemOf, verifyNoteConnections, isBlank, decodeNoteBytes, NoteDecodeError } from "./markdown-parser.js";
 import type { Connection } from "./types.js";
 import { validateOwner, resolveActiveOwner } from "./agent-identity.js";
 import { noteIdShapeError } from "./note-id.js";
@@ -3437,7 +3437,10 @@ export function stripConnectionsTo(content: string, targets: string[]): { conten
  * stick. Returns the rewritten content and whether anything changed. #119.
  */
 function stripConceptRefs(content: string, targets: string[]): { content: string; changed: boolean } {
-  const { metadata, body } = parseNote(content);
+  // Ingest reads no frontmatter from this note, so it holds no concept
+  // references to remove, whatever gray-matter reads.
+  if (frontmatterLength(normalizeNewlines(content)) === 0) return { content, changed: false };
+  const { metadata, body } = parseNoteForRewrite(content, "removing the concept from the note's frontmatter");
   const concepts = metadata.concepts;
   if (!Array.isArray(concepts)) return { content, changed: false };
   const targetSet = new Set(targets.flatMap((target) => [target, normalizeConceptSlug(target)]));
@@ -3606,10 +3609,11 @@ export async function delete_note(
         try {
           ({ content: repaired, changed } = stripConceptRefs(bodyStripped, refTokens));
         } catch (e: unknown) {
-          // The opener is fine, so the YAML itself does not parse (js-yaml
-          // refuses a duplicate key that PyYAML and the hub accept). The
-          // frontmatter may still hold a reference ingest indexed, so the
-          // note cannot be repaired safely.
+          // The opener is fine, so either the YAML itself does not parse
+          // (js-yaml refuses a duplicate key that PyYAML and the hub accept),
+          // or gray-matter and ingest read different frontmatter blocks
+          // (FrontmatterSplitError). The frontmatter may still hold a
+          // reference ingest indexed, so the note cannot be repaired safely.
           // js-yaml's message continues with a source excerpt; keep its first line.
           parseErrors.push({ relPath: source, message: (e instanceof Error ? e.message : String(e)).split("\n")[0] });
           continue;
@@ -3860,7 +3864,7 @@ export async function update_note(
     // just-deleted note with stale content. #119.
     let written: string | undefined;
     const transform = (current: string): string => {
-      const { metadata, body } = parseNote(current);
+      const { metadata, body } = parseNoteForRewrite(current, "update_note");
       const mergedBody = args.body !== undefined ? args.body : body;
       const mergedMeta: Record<string, unknown> = { ...metadata };
       if (args.frontmatter_patch !== undefined) {
