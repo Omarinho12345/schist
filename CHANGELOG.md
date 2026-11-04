@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The viewer's note panel can be resized.** Drag the thin handle on the panel's left edge, or focus it and press Left or Right (20 px per press). The width stays between 280 px and 80% of the graph area beside the sidebar, is re-clamped when the window resizes, is remembered per browser in `localStorage` (the viewer still works when storage is blocked), and double-clicking the handle restores the default 320 px. Pointer events are used, so mouse, touch and pen all work.
+
 ### Security
 - **The viewer loads DOMPurify 3.4.17, up from 3.2.6.** DOMPurify sanitizes every note body and Ask the vault answer before the page inserts it, and releases since 3.2.6 fix sanitizer bypasses. The page's script tag, its Subresource Integrity hash and its Content-Security-Policy name the new file, and the MCP server's test dependency, which a test uses to run the page's renderer, moves with it; a test now fails when the versions of marked or DOMPurify that the page loads differ from the ones the tests run. Rebuild a site with `schist build`, or use the viewer's Rebuild button, to load the new version.
 
